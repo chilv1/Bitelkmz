@@ -70,10 +70,10 @@ if st.button("Generate KMZ"):
 
     # color per operator
     OPERATOR_COLORS = {
-        "Entel": "#28FF00",     # neon green
-        "Claro": "#FF0000",     # red
-        "Movistar": "#00FFF6",  # cyan
-        "Bitel": "#FFA500",     # orange
+        "entel": "#28FF00",     # neon green
+        "claro": "#FF0000",     # red
+        "movistar": "#00FFF6",  # cyan
+        "bitel": "#FFA500",     # orange
     }
 
     def build_heatmap(df):
