@@ -9,139 +9,117 @@ import os
 import zipfile
 import simplekml
 
-# ==================================================
-# UI
-# ==================================================
-st.set_page_config(page_title="GeoHeatmap Generator", layout="centered")
+# -------------------- CONFIG --------------------
+GRID_RES = 2000
+RADIUS = 30
+THRESHOLD_RATIO = 0.3
+LAT_COL = "gps_latitude"
+LON_COL = "gps_longitude"
+OPERATOR_COL = "carrier"
 
-st.title("GeoHeatmap Generator")
-st.write("Visualize telecom density CSV data on Map & export to KMZ")
+OPERATOR_COLORS = {
+    "ENTEL":    "#0057A4",
+    "MOVISTAR": "#00A65A",
+    "CLARO":    "#D40000",
+    "BITEL":    "#FFD500"
+}
 
-st.subheader("Settings")
-GRID_RES = st.number_input("Grid Resolution (px)", value=2000)
-RADIUS = st.number_input("Blur Radius (sigma)", value=30)
-THRESHOLD_RATIO = st.number_input("Threshold Ratio (0–1)", value=0.3)
+# -------------------- COLORMAP LOGIC (GLOW) --------------------
+def hex_to_rgb(hex_color):
+    hex_color = hex_color.lstrip('#')
+    return tuple(int(hex_color[i:i+2], 16) / 255.0 for i in (0, 2, 4))
 
-uploaded_files = st.file_uploader("Upload CSV Files", accept_multiple_files=True)
+def make_glow_colormap(hex_color):
+    r, g, b = hex_to_rgb(hex_color)
+    glow_factor = 0.6
+    r2 = r + (1.0 - r) * glow_factor
+    g2 = g + (1.0 - g) * glow_factor
+    b2 = b + (1.0 - b) * glow_factor
+    colors = [
+        (r, g, b, 0.30),
+        (r2, g2, b2, 1.0)
+    ]
+    return LinearSegmentedColormap.from_list("glow_cmap", colors)
 
-if st.button("Generate KMZ"):
+# ----------------------------------------------------------
+def compute_bounds(lon, lat):
+    x1, x2 = lon.min(), lon.max()
+    y1, y2 = lat.min(), lat.max()
+    dx, dy = x2 - x1, y2 - y1
+    return (x1 - dx * 0.02, x2 + dx * 0.02, y1 - dy * 0.02, y2 + dy * 0.02)
 
-    if not uploaded_files:
-        st.error("No files uploaded")
-        st.stop()
+def build_heatmap_layer(df_op, color_hex, xmin, xmax, ymin, ymax, radius):
+    lon = df_op[LON_COL].to_numpy()
+    lat = df_op[LAT_COL].to_numpy()
+    xn = (lon - xmin) / (xmax - xmin + 1e-9)
+    yn = (lat - ymin) / (ymax - ymin + 1e-9)
+    xi = np.clip((xn * (GRID_RES - 1)).astype(int), 0, GRID_RES - 1)
+    yi = np.clip((yn * (GRID_RES - 1)).astype(int), 0, GRID_RES - 1)
+    grid = np.zeros((GRID_RES, GRID_RES), dtype=float)
+    np.add.at(grid, (yi, xi), 1.0)
+    heat = gaussian_filter(grid, sigma=radius)
+    maxh = np.nanpercentile(heat[heat > 0], 99.5)
+    if np.isnan(maxh) or maxh == 0:
+        maxh = np.max(heat)
+    cutoff = maxh * THRESHOLD_RATIO
+    heat[heat < cutoff] = np.nan
+    cmap = make_glow_colormap(color_hex)
+    fig, ax = plt.subplots(figsize=(10, 10))
+    ax.imshow(
+        heat,
+        origin="lower",
+        extent=[xmin, xmax, ymin, ymax],
+        cmap=cmap,
+        interpolation="bilinear",
+        vmin=cutoff,
+        vmax=maxh
+    )
+    ax.set_axis_off()
+    png_file = tempfile.mktemp(suffix=".png")
+    fig.savefig(png_file, dpi=300, transparent=True, bbox_inches="tight", pad_inches=0)
+    plt.close(fig)
+    return png_file
 
+def create_kmz(layers, xmin, xmax, ymin, ymax):
+    kml = simplekml.Kml()
+    kml.document.name = "Operators Density Heatmaps"
+    for op_name, png in layers.items():
+        g = kml.newgroundoverlay(name=op_name)
+        g.icon.href = os.path.basename(png)
+        g.latlonbox.north = ymax
+        g.latlonbox.south = ymin
+        g.latlonbox.east = xmax
+        g.latlonbox.west = xmin
+    kml_file = tempfile.mktemp(suffix=".kml")
+    kml.save(kml_file)
+    kmz_file = tempfile.mktemp(suffix=".kmz")
+    with zipfile.ZipFile(kmz_file, "w", zipfile.ZIP_DEFLATED) as z:
+        z.write(kml_file, "doc.kml")
+        for png in layers.values():
+            z.write(png, os.path.basename(png))
+    return kmz_file
+
+# ============================= STREAMLIT UI =============================
+st.title("KMZ Heatmap Generator")
+uploaded_files = st.file_uploader("Upload CSV files", accept_multiple_files=True)
+
+if uploaded_files and st.button("Generate KMZ"):
     dfs = []
     for f in uploaded_files:
         df = pd.read_csv(f, sep=None, engine="python")
-        dfs.append(df)
+        df.columns = df.columns.str.lower().str.strip()
+        df[OPERATOR_COL] = df[OPERATOR_COL].astype(str).str.upper().str.strip()
+        dfs.append(df[[LAT_COL, LON_COL, OPERATOR_COL]].dropna())
     df_all = pd.concat(dfs, ignore_index=True)
-
-    # auto detect columns
-    lat_cols = [c for c in df_all.columns if "lat" in c.lower()]
-    lon_cols = [c for c in df_all.columns if "lon" in c.lower()]
-    op_cols  = [c for c in df_all.columns if "carrier" in c.lower()]
-
-    if not lat_cols or not lon_cols or not op_cols:
-        st.error("Missing lat/lon/operator column")
-        st.stop()
-
-    LAT_COL = lat_cols[0]
-    LON_COL = lon_cols[0]
-    OPERATOR_COL = op_cols[0]
-
-    df_all[LAT_COL] = pd.to_numeric(df_all[LAT_COL], errors="coerce")
-    df_all[LON_COL] = pd.to_numeric(df_all[LON_COL], errors="coerce")
-    df_all = df_all.dropna(subset=[LAT_COL, LON_COL])
-
-    # compute bounds
     lon = df_all[LON_COL].to_numpy()
     lat = df_all[LAT_COL].to_numpy()
-    xmin, xmax = lon.min(), lon.max()
-    ymin, ymax = lat.min(), lat.max()
-
-    dx = xmax - xmin
-    dy = ymax - ymin
-
-    # expand bounds
-    xmin -= dx * 0.02
-    xmax += dx * 0.02
-    ymin -= dy * 0.02
-    ymax += dy * 0.02
-
-    # color per operator
-    OPERATOR_COLORS = {
-        "entel": "#28FF00",     # neon green
-        "claro": "#FF0000",     # red
-        "movistar": "#00FFF6",  # cyan
-        "bitel": "#FFA500",     # orange
-    }
-
-    def build_heatmap(df):
-        lon = df[LON_COL].to_numpy()
-        lat = df[LAT_COL].to_numpy()
-
-        # normalize
-        xn = (lon - xmin) / (xmax - xmin + 1e-9)
-        yn = (lat - ymin) / (ymax - ymin + 1e-9)
-
-        xi = np.clip((xn * (GRID_RES - 1)).astype(int), 0, GRID_RES - 1)
-        yi = np.clip(((1 - yn) * (GRID_RES - 1)).astype(int), 0, GRID_RES - 1)
-
-        grid = np.zeros((GRID_RES, GRID_RES), dtype=float)
-        np.add.at(grid, (yi, xi), 1)
-
-        heat = gaussian_filter(grid, sigma=RADIUS)
-
-        # adaptive max
-        maxh = np.nanpercentile(heat, 99.5)
-        heat = np.clip(heat / maxh, 0, 1)
-
-        return heat
-
-    tmpdir = tempfile.mkdtemp()
+    xmin, xmax, ymin, ymax = compute_bounds(lon, lat)
     layers = {}
-
-    for op, hex_color in OPERATOR_COLORS.items():
-        df_op = df_all[df_all[OPERATOR_COL].str.lower() == op]
-
-        if df_op.empty:
-            continue
-
-        st.write(f"Processing {op}...")
-
-        H = build_heatmap(df_op)
-
-        # convert hex to RGBA
-        c = tuple(int(hex_color.lstrip("#")[i:i+2], 16)/255 for i in (0,2,4))
-        rgba = np.zeros((GRID_RES, GRID_RES, 4))
-        rgba[...,0] = c[0]
-        rgba[...,1] = c[1]
-        rgba[...,2] = c[2]
-        rgba[...,3] = H * 0.8
-
-        png_path = os.path.join(tmpdir, f"{op}.png")
-        plt.imsave(png_path, rgba)
-        layers[op] = png_path
-
-    # build KMZ
-    kmz_path = os.path.join(tmpdir, "operators_heatmap.kmz")
-    kml_path = os.path.join(tmpdir, "doc.kml")
-    kml = simplekml.Kml()
-
-    for op, png in layers.items():
-        ground = kml.newgroundoverlay(name=op)
-        ground.icon.href = os.path.basename(png)
-        ground.latlonbox.north = ymax
-        ground.latlonbox.south = ymin
-        ground.latlonbox.east = xmax
-        ground.latlonbox.west = xmin
-
-    kml.save(kml_path)
-
-    with zipfile.ZipFile(kmz_path, "w") as z:
-        z.write(kml_path, "doc.kml")
-        for op, png in layers.items():
-            z.write(png, os.path.basename(png))
-
-    with open(kmz_path, "rb") as f:
-        st.download_button("Download KMZ", data=f, file_name="operators_heatmap.kmz")
+    for op in df_all[OPERATOR_COL].unique():
+        df_op = df_all[df_all[OPERATOR_COL] == op]
+        hex_color = OPERATOR_COLORS.get(op, "#808080")
+        png = build_heatmap_layer(df_op, hex_color, xmin, xmax, ymin, ymax, RADIUS)
+        layers[op] = png
+    kmz = create_kmz(layers, xmin, xmax, ymin, ymax)
+    with open(kmz, "rb") as f:
+        st.download_button("Download KMZ", f, file_name="operators_heatmap_glow.kmz")
